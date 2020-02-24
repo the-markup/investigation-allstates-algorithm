@@ -1,0 +1,972 @@
+ ---
+title: "How We Analyzed Allstate’s Car Insurance Algorithm"
+author: "Maddy Varner, Dina Haner, Andrew Cohen and Aaron Sankin"
+output: html_notebook
+---
+
+# How We Analyzed Allstate’s Car Insurance Algorithm
+_By Maddy Varner, Dina Haner, Andrew Cohen and Aaron Sankin_
+
+## Code Setup
+
+### Merging
+```{r setup, include=FALSE}
+##Define package list
+Packages<-c("readr","ggpubr","ggplot2","reshape2","rpart","caret","ggforce","tidyverse","lubridate","gridExtra",
+            "scales","choroplethr","gridExtra","broom","kableExtra","tidyr","dplyr")
+.packages = Packages
+
+##Install CRAN packages (if not already installed)
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+##Load packages into session 
+lapply(.packages, require, character.only=TRUE)
+```
+
+First, we want a list of filenames. You should make sure the paths given here are correct for you!
+```{r echo=FALSE}
+# PUT FILENAMES HERE
+data_folder = '../data/csv/'
+
+fn_dp03 <- paste(data_folder,"ACS_MD_15_5YR_DP03.csv", sep="")
+fn_dp05 <- paste(data_folder,"ACS_MD_15_5YR_DP05.csv", sep="")
+
+fn_customers <- paste(data_folder, "cgr-premiums-table.csv", sep="")
+fn_territories <- paste(data_folder, "territory-definitions-table.csv", sep="")
+fn_cgr <- paste(data_folder, "cgr-definitions-table.csv", sep="")
+```
+
+Then, we'll load the US Census tables -- We're using ZCTA-level data from the 2014 5-Year American Community Survey.
+```{r echo=FALSE}
+acs_dp03 <- read_csv(fn_dp03)
+acs_dp05 <- read_csv(fn_dp05)
+
+acs_dp05$population <- acs_dp05$HC01_VC94 + acs_dp05$HC01_VC88 + acs_dp05$HC01_VC95 + acs_dp05$HC01_VC96 + acs_dp05$HC01_VC97 + acs_dp05$HC01_VC98 + acs_dp05$HC01_VC99
+acs_dp05$percentage_nonwhite <- 1.0 * (acs_dp05$population - acs_dp05$HC01_VC94) / acs_dp05$population
+acs_dp05$majority_minority <- acs_dp05$percentage_nonwhite > 0.5
+race <- acs_dp05[,c('GEO.id2', 'population', 'percentage_nonwhite', 'majority_minority')]
+
+acs_dp03$median_income <- acs_dp03$HC01_VC85
+income <- acs_dp03[,c('GEO.id2', "median_income")]
+```
+
+Then we will load tables from the Allstate filing.
+```{r echo=FALSE}
+maryland <- read_csv(fn_customers)
+territory <- read_csv(fn_territories)
+cgr <- read_csv(fn_cgr)
+
+initial_row_count <- nrow(maryland)
+```
+
+Next, we'll merge tables together.
+```{r echo=FALSE}
+## The CGR factor included rounds to the hundredth place. Use the factor included in the CGR definition table.
+cgr <- cgr[,c('cgr', "aa")]
+maryland <- merge(maryland, cgr, by="cgr")
+maryland$cgr_factor <- maryland$aa
+maryland$aa <- NULL
+
+## Drop duplicate zip codes in the territory table
+territory <- territory[order(territory$territory, decreasing=TRUE),]
+territory <- territory[!duplicated(territory$territory),]
+
+## Let's merge Allstate's "territory definitions" (geographic data) with each row so we can use Census data
+maryland <- merge(maryland, territory, by="territory")
+
+## Finally, let's merge the ACS data for each Maryland policy holder
+maryland <- merge(maryland, race, by.x = "zipcode", by.y="GEO.id2")
+maryland <- merge(maryland, income, by.x = "zipcode", by.y="GEO.id2")
+```
+
+
+### Feature Engineering
+#### Normalizing and Bucketing
+Now we will perform feature engineering by normalize values, and create buckets based on the age of the policy holder.
+```{r echo=FALSE}
+## Let's rename the variables from the Maryland table so they make sense!
+maryland$current_price <- maryland$current_premium
+maryland$transition_price <- maryland$selected_premium
+maryland$ideal_price <- maryland$indicated_premium
+
+## Let's get the percentage change of indicated and selected premiums.
+maryland$price_change <- (maryland$transition_price - maryland$current_price) / maryland$current_price * 100
+maryland$ideal_price_change <- (maryland$ideal_price - maryland$current_price) / maryland$current_price * 100
+
+## We also want to calculate the age of each policy holder using:
+### The filing's requested effective date, 04/11/2014
+### The policy holder's birthdate
+effective_date <- as.Date("04/11/2014", "%m/%d/%Y")
+maryland$age <- floor(time_length(difftime(effective_date, as.Date(maryland$birthdate, "%m/%d/%Y")),"years"))
+
+##categorize into three buckets of age as observed in dataset
+maryland$age_bucket<-ifelse(
+  maryland$age<41,
+  "16-40",
+  ifelse(maryland$age>40&maryland$age<63,
+         "41-62","63+"
+  )
+)
+
+## We will break ages the rough categories of percentage shifts as observed in the "Effects of the Retention Model on Maryland Customers" section of the white paper
+maryland$shift_category <- ifelse((maryland$price_change >= 9.5),"Large Increase","Small Discount")
+maryland$shift_category <- ifelse((maryland$current_price < maryland$transition_price) & maryland$shift_category == "Small Discount","Small Increase",maryland$shift_category)
+
+## We will take the binomial signals identified in the paper and turn them ino booleans
+
+maryland$is_above_current <- maryland$current_price >= 1883
+maryland$is_above_difference <- maryland$ideal_price - maryland$current_price >= 381
+
+maryland$is_both <- maryland$is_above_current & maryland$is_above_difference
+
+maryland$IndMinCur <- maryland$indicated_premium - maryland$current_premium
+maryland$SelMinCur <- maryland$selected_premium - maryland$current_premium
+maryland$SelDivCur <- maryland$selected_premium / maryland$current_premium
+maryland$IncDivCur <- maryland$indicated_premium / maryland$current_premium
+maryland$SelDivInd <- maryland$selected_premium / maryland$indicated_premium
+
+##categorize into three buckets
+maryland$IncCat<-ifelse(
+  maryland$SelDivCur<=1,
+  "Decreased or No Change",
+  ifelse(maryland$SelDivCur>1&maryland$SelDivCur<1.0502,
+         "Small Increase","Large Increase"
+  )
+)
+
+##cut percentange_nonwhite into four equal intervals
+maryland$PNW_bucket4<-cut(maryland$percentage_nonwhite,
+                       breaks=seq(0,1,0.25),
+                       labels=c("0-0.25",">0.25-.5",">0.5-0.75",">0.75-1"))
+```
+
+#### Filtering out rows
+We will now filter out policy holders without demographic data.
+```{r}
+md <- filter(maryland, !is.na(median_income) & !is.na(percentage_nonwhite))
+```
+
+#### How many policy holders were removed?
+```{r}
+clean_row_count <- nrow(md)
+paste("Initial rows:", initial_row_count)
+paste("Rows used in analysis:",clean_row_count)
+paste("Rows removed:",initial_row_count - clean_row_count)
+```
+
+
+## Abstract
+
+```{r}
+## In Allstate’s filing, it indicated more than half of its customers...
+nrow(filter(md, current_premium > indicated_premium)) / nrow(md)
+```
+
+```{r}
+# Divided increases into 10 groups
+quantile(filter(md, indicated_premium > current_premium)$SelMinCur, prob = seq(0, 1, length = 11)) # > 78.560 
+quantile(filter(md, indicated_premium > current_premium)$SelDivCur, prob = seq(0, 1, length = 11)) # > 1.049705
+
+median(md$current_premium)
+median(filter(md, SelMinCur > 78.560)$current_premium)
+median(filter(md, SelDivCur > 1.049705)$current_premium)
+
+```
+
+
+```{r echo= FALSE}
+#max(filter(md, IncCat == "Small Increase")$SelDivCur)
+```
+
+
+```{r echo=FALSE}
+
+## '...this age group had the highest median current prices'
+young <- md %>% filter(age < 41)
+middle <- md %>% filter(41 <= age & age <= 62)
+old <- md %>% filter(62 < age)
+
+median(young$current_premium)
+median(middle$current_premium)
+median(old$current_premium)
+```
+
+```{r echo=FALSE}
+## while Allstate’s own data stated that more than half of its customers in Maryland were being overcharged,
+paste0(nrow(filter(md, indicated_premium < current_premium)) / nrow(md) * 100, "%")
+
+## that none of them should be given a substantial discount. (largest discount is 32.80, "ideal" discount was $868.30 for that person)
+head(select(md[order(md$SelMinCur),], current_premium, indicated_premium, selected_premium, IndMinCur, SelMinCur), 1)
+
+## Customers aged 63 and older were most affected by the lack of meaningful discounts.
+md %>% group_by(IncCat, age_bucket) %>% summarise(n = n(), median_ideal = median(IndMinCur), mean_ideal = mean(IndMinCur)) 
+```
+
+## Introduction
+
+## Methodology
+
+### How We Acquired the Data
+
+
+```{r echo=FALSE}
+paste0('with individual pricing information for ', initial_row_count, ' Allstate policyholders')
+```
+
+```{r echo=FALSE}
+paste0('Of the ', initial_row_count, ' entries, ', (initial_row_count - clean_row_count),' had zip codes not included in the ACS data, and were removed.')
+```
+
+### How Allstate’s Proposed Pricing in Maryland Worked
+
+```{r echo=FALSE}
+nrow(filter(md, IndMinCur > 2000))
+nrow(filter(md, IndMinCur > 200))
+```
+
+```{r}
+## If we control for indicated minus current?
+#varImp(fit)
+```
+
+```{r echo=FALSE}
+md %>% filter(age == 32) %>% filter(gender == "M") %>% filter(county == "PRINCE GEORGES") %>% filter(current_premium == 2617.42) %>% select(age, gender, county, current_premium, IncDivCur, SelDivCur, SelMinCur, selected_premium)
+```
+
+```{r echo=FALSE}
+md %>% filter(age == 32) %>% filter(gender == "M") %>% filter(county == "PRINCE GEORGES") %>% filter(current_premium == 814.48) %>% select(age, gender, county, current_premium, IncDivCur, SelDivCur, SelMinCur, selected_premium)
+```
+
+### Effects of the Proposed Retention Model on Maryland Customers
+
+```{r Linear Models,include=TRUE}
+
+##Main Effects model
+lm0<-lm(selected_premium~current_premium+indicated_premium,data=md)#Fit the model
+summ_lm0<-tidy(lm0)#Get results in nice table
+summ_lm0$AdjRSqu<-c(round(summary(lm0)$adj.r.squared,4),"-","-")#Pull R-square estimate from model summary
+summ_lm0$estimate<-round(summ_lm0$estimate,2)
+summ_lm0$std.error<-round(summ_lm0$std.error,4)
+summ_lm0$statistic<-round(summ_lm0$statistic,2)
+summ_lm0$p.value<-round(summ_lm0$p.value,4)
+AddRow<-t(data.frame(c("current_premium*indicated_premium","-","-","-","-","-")))#Add additional row for easy binding with full interaction model table
+colnames(AddRow)<-colnames(summ_lm0)
+summ_lm0<-rbind(summ_lm0,AddRow)
+rownames(summ_lm0) <- NULL#Remove rownames
+
+##Full Interaction model
+lm1<-lm(selected_premium~current_premium*indicated_premium,data=md)
+summ_lm1<-tidy(lm1)
+summ_lm1$AdjRSqu<-c(round(summary(lm1)$adj.r.squared,4),"-","-","-")
+summ_lm1$estimate<-round(summ_lm1$estimate,2)
+summ_lm1$std.error<-round(summ_lm1$std.error,4)
+summ_lm1$statistic<-round(summ_lm1$statistic,2)
+summ_lm1$p.value<-round(summ_lm1$p.value,4)
+summ_lm1<-summ_lm1%>%
+  select("estimate", "std.error", "statistic",
+         "p.value", "AdjRSqu")
+
+summ_lm<-cbind(summ_lm0,summ_lm1)#Put the two tables together
+
+##Outputs nice table in markdown file
+kable(summ_lm) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))%>%
+  add_header_above(c(" " = 1, 
+                     "Main Effects" = 5, "Full Interaction" = 5))%>%
+  add_header_above(c("Model Output for Both Main Effects and Full Interaction Models Using Current and Indicated as Predictors"=11))
+
+
+##Main Effects model using IndMinCur instead of indicated
+lm2<-lm(selected_premium~current_premium+IndMinCur,data=md)#Fit the model
+summ_lm2<-tidy(lm2)#Get results in nice table
+summ_lm2$AdjRSqu<-c(round(summary(lm2)$adj.r.squared,4),"-","-")#Pull R-square estimate from model summary
+summ_lm2$estimate<-round(summ_lm2$estimate,2)
+summ_lm2$std.error<-round(summ_lm2$std.error,4)
+summ_lm2$statistic<-round(summ_lm2$statistic,2)
+summ_lm2$p.value<-round(summ_lm2$p.value,4)
+AddRow<-t(data.frame(c("current_premium*IndMinCur","-","-","-","-","-")))#Add additional row for easy binding with full interaction model table
+colnames(AddRow)<-colnames(summ_lm2)
+summ_lm2<-rbind(summ_lm2,AddRow)
+rownames(summ_lm2) <- NULL#Remove rownames
+
+##Full Interaction model using IndMinCur instead of indicated
+lm3<-lm(selected_premium~current_premium*IndMinCur,data=md)
+summ_lm3<-tidy(lm3)
+summ_lm3$AdjRSqu<-c(round(summary(lm3)$adj.r.squared,4),"-","-","-")
+summ_lm3$estimate<-round(summ_lm3$estimate,2)
+summ_lm3$std.error<-round(summ_lm3$std.error,4)
+summ_lm3$statistic<-round(summ_lm3$statistic,2)
+summ_lm3$p.value<-round(summ_lm3$p.value,4)
+summ_lm3<-summ_lm3%>%
+  select("estimate", "std.error", "statistic",
+         "p.value", "AdjRSqu")
+
+summ_lm_IndMinCur<-cbind(summ_lm2,summ_lm3)#Put the two tables together
+
+kable(summ_lm_IndMinCur) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))%>%
+  add_header_above(c(" " = 1, 
+                     "Main Effects" = 5, "Full Interaction" = 5))%>%
+  add_header_above(c("Model Output for Both Main Effects and Full Interaction Models Using Current and (Indicated-Current) as Predictors"=11))
+
+```
+
+```{r Residuals Charts, include=TRUE}
+
+##Extract data and define variables for plotting
+ResModelSet<-cbind(lm0[["model"]],lm0$residuals)
+colnames(ResModelSet)[4]<-"Residuals"
+ResModelSet$PriceChange<-(ResModelSet$selected_premium/ResModelSet$current_premium-1)*100
+ResModelSet$IndMinCur<-ResModelSet$indicated_premium-ResModelSet$current_premium
+ResModelSet$Index <- 1:nrow(ResModelSet)
+ResModelSet$IncCat<-ifelse(
+  ResModelSet$PriceChange<=0,
+  "Decreased or No Change",
+  ifelse(ResModelSet$PriceChange>0&ResModelSet$PriceChange<5.02,
+         "Small Increase","Large Increase"
+  )
+)
+
+##Plot Residuls across index colored by Price Change
+residuals.chart <- ggplot(ResModelSet,aes(x=Index,y=Residuals,col=PriceChange))+
+  geom_point()+
+  scale_color_gradient2(midpoint=7, low="blue", mid="orange",
+                        high="red", space ="Lab" ,
+                        name = "Price\nChange (%)")+
+  ggtitle("\n\nRegression Residuals vs Index",
+             subtitle="We expect to see a normally distributed scattering around Residuals=0")+
+    theme_minimal(base_size=20,base_line_size=11/22
+  )
+
+##Turn IncCat to factor so manual ordering can be done 
+ResModelSet<-transform(ResModelSet, 
+          IncCat=factor(IncCat,
+                        levels=c("Decreased or No Change",
+                                 "Small Increase",
+                                 "Large Increase")))
+
+
+##Plot Price Change vs Residuals clored by Price Change
+change.v.residuals.chart <- ggplot(ResModelSet,aes(x=Residuals,y=PriceChange,col=PriceChange))+
+  geom_point()+xlab("Residuals ($)")+
+  geom_hline(yintercept=9)+ geom_hline(yintercept=0)+
+  scale_y_continuous(name = "Price Change (%)",
+                     #labels = percent,
+                     limits = c(-2.5,22.5),
+                     breaks=seq(-2.5,22.5,2.5))+ #ylim(-5,25)+
+  ggtitle("\n\nPrice Change vs Regression Residuals",
+             subtitle="Observable anamolous shift in the data")+
+  scale_color_gradient2(midpoint=7, low="blue", mid="orange",
+                        high="red", space ="Lab",
+                        name = "Price\nChange")+
+  annotate("text", label = "Policies that received an increase >= 9.5%", 
+           x =-180 , y = 15, size = 5, colour = "black")+
+  annotate("text", label = "Policies that received an increase < 9.5%", 
+           x =500 , y = 5, size = 5, colour = "black")+
+  annotate("text", label = "Policies that received a decrease", 
+           x =500 , y = -1, size = 5, colour = "black")+
+  theme_minimal(base_size=20,base_line_size=11/22
+  )
+
+##Zoom in on histograms of each Increase Category
+change.distributions.chart <- ggplot(ResModelSet,aes(x=PriceChange))+
+  geom_histogram(aes(fill=IncCat),bins = 200)+
+  facet_wrap(~IncCat,scales = "free")+
+  #ylim(0,4500)+
+  scale_fill_manual(values=c("darkviolet","orange","Red"),
+                    name="Increase Category")+
+  ggtitle("\n\nPrice Change Distributions by Increase Category",
+             subtitle="Increase categories are PC<=0, 0<PC<=5.02, and PC>=9.5")+
+    theme_minimal(base_size=20,base_line_size=11/22
+  )+ylab("Frequency (bins=200)")+xlab("Price Change (%)")+
+  theme(axis.text.x = element_text(angle = 70))+
+  theme(legend.position = "none")
+
+##Table with counts and corresponding proportions of Increase Categories
+table1<-aggregate(ResModelSet$PriceChange,
+          by=list(ResModelSet$IncCat),
+          FUN="length")
+colnames(table1)<-c("Increase Category","Count")
+table1$Proportion<-round(table1$Count/sum(table1$Count),4)
+
+##Display table with counts
+kable(table1) %>%
+  kable_styling(full_width = F)%>%
+  add_header_above(c("Proportion of Sample by Increase Category"=3))
+
+change.distributions.chart
+change.v.residuals.chart
+residuals.chart
+```
+
+```{r Large Increase Payers Already Pay A Lot, echo=FALSE}
+## $1883 -- the minimum current premium found in the increase group, is in the top 10% of all current premiums.
+quantile(md$current_premium, prob = seq(0, 1, length = 11))
+min(filter(md, SelDivCur > 1.095)$current_premium)
+```
+
+```{r Scatter Plot, include = TRUE}
+##Final premium vs Current Premium
+final.v.current.chart <- ggplot(md,aes(x=current_premium,y=selected_premium,col=price_change))+
+  geom_point()+
+  scale_y_continuous(name = "Selected Premium",
+                     labels = dollar,
+                     limits = c(0,9000),
+                     breaks=seq(0,9000,300))+ #ylim(-5,25)+
+  scale_x_continuous(name = "Current Premium",
+                     labels = dollar,
+                     limits = c(0,9000),
+                     breaks=seq(0,9000,300))+ #ylim(-5,25)+
+  ggtitle("\n\nSelected Premium vs Current Premium",
+             subtitle="Observable anamolous shift in the data")+
+  geom_vline(xintercept=1883)+
+  scale_color_gradient2(midpoint=7, low="blue", mid="orange",
+                        high="red", space ="Lab",
+                        name = "Price\nChange")+
+  annotate("text", label = "All policies that received an increase >= 9.5% had a current premium >=$1883", 
+           x =4800 , y = 9000, size = 4, colour = "black")+
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  theme(axis.text.x = element_text(angle = 70))
+
+##Final Premium vs Indicated Premium
+final.v.indicated.chart <- ggplot(md,aes(x=indicated_premium,y=selected_premium,col=price_change))+
+  geom_point()+
+  scale_y_continuous(name = "Selected Premium",
+                     labels = dollar,
+                     limits = c(0,9000),
+                     breaks=seq(0,9000,300))+ #ylim(-5,25)+
+  scale_x_continuous(name = "Indicated Premium",
+                     labels = dollar,
+                     limits = c(0,9000),
+                     breaks=seq(0,9000,300))+ #ylim(-5,25)+
+  ggtitle("\n\nSelected Premium vs Indicated Premium",
+             subtitle="Observable anamolous shift in the data")+
+  scale_color_gradient2(midpoint=7, low="blue", mid="orange",
+                        high="red", space ="Lab",
+                        name = "Price\nChange")+
+  # annotate("text", label = "What to say here", 
+  #          x =5000 , y = 9000, size = 4, colour = "black")+
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  theme(axis.text.x = element_text(angle = 70))
+
+##Indicated minus Current vs Current Premium
+difference.v.current.chart <- ggplot(md,aes(y=(indicated_premium-current_premium),x=current_premium,col=price_change))+
+  geom_point()+
+  scale_y_continuous(name = "Indicated Premium minus Current Premium",
+                     labels = dollar,
+                     limits = c(-5000,8000),
+                     breaks=seq(-8000,8000,500))+ 
+  scale_x_continuous(name = "Current Premium",
+                     labels = dollar,
+                     limits = c(0,9000),
+                     breaks=seq(0,9000,300))+ 
+  ggtitle("\n\nIndicated Minus Current vs Current Premium",
+             subtitle="Observable boundaries of shifted group")+
+  scale_color_gradient2(midpoint=7, low="blue", mid="orange",
+                        high="red", space ="Lab",
+                        name = "Price\nChange")+ 
+  annotate("text", label = ("All policies that received an increase >= 9.5% had a current premium >=$1883"), 
+           x =5550 , y = 8000, size = 4, colour = "black")+
+  annotate("text", label = ("All policies that received an increase >= 9.5% had a difference between current and indicated >=$381"), 
+           x =5550 , y = 7500, size = 4, colour = "black")+
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  theme(axis.text.x = element_text(angle = 70))
+
+##Proportion tables and testing next section
+final.v.current.chart
+final.v.indicated.chart
+difference.v.current.chart
+```
+
+```{r echo=FALSE}
+## N% of Maryland customers would have recieved...
+md %>% filter(IncCat == "Decreased or No Change") %>% nrow() / nrow(md) * 100
+
+paste0("No customer got a transition discount greater than ", (1 - min(md$SelDivCur)) * 100, "%") 
+
+## These customers had a median difference
+discounts <- md %>% filter(IncCat == "Decreased or No Change")
+median(discounts$IndMinCur)
+median(discounts$SelMinCur)
+
+## More than half of all Maryland customers were owed
+md %>% filter(indicated_premium < current_premium) %>% nrow() / nrow(md) * 100
+
+## Who got no discounts?
+md %>% filter(current_premium == selected_premium) %>% nrow()
+
+## Who got no discounts and had the largest discount owed?
+md %>% filter(current_premium == selected_premium) %>% select(current_premium, indicated_premium, selected_premium, IndMinCur) %>% arrange((IndMinCur))
+```
+
+```{r echo=FALSE}
+md %>% filter(current_premium == 6149.75) %>% filter(indicated_premium == 1795.52) %>% select(gender, current_premium, indicated_premium, selected_premium, SelMinCur)
+```
+
+```{r echo=FALSE}
+small <- md %>% filter(IncCat == "Small Increase")
+
+paste0((nrow(small) / nrow(md) * 100), '% of Maryland customers would have received a small transition increase')
+
+## In this category,
+median(small$IncDivCur)
+
+## Instead of such a large increase
+max(small$SelDivCur)
+```
+
+```{r echo=FALSE}
+large <- md %>% filter(IncCat == "Large Increase")
+
+paste0(nrow(large) / nrow(md) * 100, "% of Maryland customers would have received a much larger transition increase.")
+
+paste0("These increases ranged from ", (min(large$SelDivCur) - 1) * 100, " to ", (max(large$SelDivCur) - 1) * 100," percent.")
+
+## These customers were already paying some of the highest premiums.
+quantile(md$current_premium, prob = seq(0, 1, length = 11))
+min(filter(md, SelDivCur > 1.095)$current_premium)
+
+paste0("The smallest current premium being paid by customers in this group was $", min(large$current_premium))
+
+## More than double
+min(large$current_premium) / median(md$current_premium)
+
+paste0("the median overall price customers in the dataset were paying at the time of the proposal, $", median(md$current_premium))
+```
+
+
+
+### Exploring the Retention Model Effects with CART Analysis
+
+```{r CART Analysis, include=TRUE}
+set.seed(216)
+inTraining <- createDataPartition(md$IncCat, p = .8, list = FALSE)
+training <- md[ inTraining, ]
+testing <- md[ -inTraining, ]
+
+fitControl <- trainControl(## 5-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated ten times
+                           repeats = 5)
+
+set.seed(614)
+fit <- train(IncCat ~ current_premium + IndMinCur + gender + age + ypc + median_income + majority_minority, 
+             data = training, 
+             method="rpart2", 
+             trControl = fitControl
+             )
+```
+
+```{r}
+pred <- predict(fit, testing)
+confusionMatrix(pred, as.factor(testing$IncCat))
+
+length(pred)
+```
+
+```{r Decision Tree Visual}
+plot(fit$finalModel)
+text(fit$finalModel)
+```
+
+```{r}
+varImp(fit)
+```
+
+### Disproportionate Effects
+
+```{r Check Props Function,include=FALSE}
+##function to get proportions tables
+CheckPropFun<-function(CatVarName,df){
+  
+  df1<-df
+  CheckProp<-aggregate(df1$SelDivCur,
+                       by=list(df1$IncCat,df1[[CatVarName]]),FUN="length")
+  TotalCatVar<-aggregate(CheckProp$x,by=list(CheckProp$Group.2),FUN="sum")
+  TotalCatVar$Totals<-round(sum(TotalCatVar$x),4)
+  TotalCatVar$Proportions<-round(TotalCatVar$x/sum(TotalCatVar$x),4)
+  colnames(TotalCatVar)[1]<-"Group.2"
+  TotalCatVar$Group.1<-"Group Total"
+  TotalCatVar<-TotalCatVar[c(5,1,2,3,4)]
+  IncCatTotals<-aggregate(df1$SelDivCur,
+                          by=list(df1$IncCat),FUN="length")
+  colnames(IncCatTotals)[2]<-"Totals"
+  CheckProp<-merge(CheckProp,IncCatTotals)
+  # CheckProp$Totals<-ifelse(CheckProp$Group.1=="Decreased or No Change",
+  #                          IncCatTotals$x[1],
+  #                          ifelse(CheckProp$Group.1=="Large Increase",
+  #                                 IncCatTotals$x[2],
+  #                                 IncCatTotals$x[3])
+  # )
+
+  CheckProp$Proportions<-round(CheckProp$x/CheckProp$Totals,10)
+  names_cat<-unique(CheckProp$Group.2)
+  lengthnames<-length(names_cat)
+  
+  ##Test each proportion against pop proprotion
+  #####################################################################
+  for(k in 1:lengthnames){
+    
+    Subset<-CheckProp%>%
+      filter(Group.2==names_cat[k])
+    succ1vec<-c(Subset$x[1],TotalCatVar$x[which(TotalCatVar$Group.2==Subset$Group.2[1])])
+    succ2vec<-c(Subset$x[3],TotalCatVar$x[which(TotalCatVar$Group.2==Subset$Group.2[1])])
+    succ3vec<-c(Subset$x[2],TotalCatVar$x[which(TotalCatVar$Group.2==Subset$Group.2[1])])
+    tot1vec<-c(Subset$Totals[1],TotalCatVar$Totals[which(TotalCatVar$Group.2==Subset$Group.2[1])])
+    tot2vec<-c(Subset$Totals[3],TotalCatVar$Totals[which(TotalCatVar$Group.2==Subset$Group.2[1])])
+    tot3vec<-c(Subset$Totals[2],TotalCatVar$Totals[which(TotalCatVar$Group.2==Subset$Group.2[1])])
+    test1<-prop.test(succ1vec,tot1vec,p=NULL,alternative = "two.sided",conf.level = 0.9999)$p.value
+    test2<-prop.test(succ2vec,tot2vec,p=NULL,alternative = "two.sided",conf.level = 0.9999)$p.value
+    test3<-prop.test(succ3vec,tot3vec,p=NULL,alternative = "two.sided",conf.level = 0.9999)$p.value
+    
+    if(test1<=0.0001|test2<=0.0001|test3<=0.0001){
+        dec0<-"Yes"
+      }else{dec0<-"No"}
+    
+    if(k == 1){
+      dec2<-dec0
+    }else{dec2<-c(dec2,dec0)}
+  }
+    dec3<-data.frame(dec2,names_cat)
+  
+  #####################################################################
+  
+  ##Test multiple proportions against each other
+  #####################################################################
+  
+  for(k in 1:lengthnames){
+    
+    propvec<-CheckProp%>%
+      filter(Group.2==names_cat[k])%>%
+      dplyr::select(Proportions)
+    samplesize = CheckProp%>%
+      filter(Group.2==names_cat[k])%>%
+      dplyr::select(x)
+    
+    p = propvec$Proportions
+    N = length(p)
+    ss = samplesize$x
+    value = critical.range = c()
+    
+    ## Compute critical values.
+    for (i in 1:(N-1)){ 
+      for (j in (i+1):N){
+      value = round(c(value,(abs(p[i]-p[j]))),10)
+      critical.range = c(critical.range,
+                         sqrt(qchisq(.9999,4))*sqrt(p[i]*(1-p[i])/ss[i] + p[j]*(1-p[j])/ss[j]))
+    }}
+    
+    prop_test<-as.data.frame(round(cbind(value,critical.range),8))
+    prop_test$SigDec<-ifelse(prop_test$value>=prop_test$critical.range,"Yes","No")
+    colnames(prop_test)<-c("value","critical.range","SigDec")
+    if("Yes" %in% prop_test$SigDec){
+      dec0<-"Yes"
+    }else{dec0<-"No"}
+    
+    if(k == 1){
+      dec<-dec0
+    }else{dec<-c(dec,dec0)}
+    
+    #return(dec)
+  }
+    dec4<-data.frame(dec,names_cat)
+  #####################################################################
+  
+  CheckProp0<-CheckProp%>%
+    dplyr::select(Group.2,Group.1,Proportions)
+  CheckProp0$Proportions<-round(CheckProp0$Proportions,4)
+  CheckProp1<-data.frame(spread(CheckProp0, Group.1, Proportions),TotalCatVar$Proportions)
+  #CheckProp2<-cbind(TotalCatVar$Proportions,CheckProp1)
+  colnames(CheckProp1)[1]<-CatVarName
+  CheckProp2<-CheckProp1[c(1,5,2,4,3)]
+  colnames(CheckProp2)[2]<-"Group Total"
+  colnames(CheckProp2)[3]<-"Decreased or No Change"
+  colnames(CheckProp2)[4]<-"Small Increase"
+  colnames(CheckProp2)[5]<-"Large Increase"
+  colnames(dec3)[2]<-CatVarName
+  colnames(dec4)[2]<-CatVarName
+  CheckProp3<-merge(CheckProp2,dec3)
+  CheckProp4<-merge(CheckProp3,dec4)
+  colnames(CheckProp4)[6]<-"Diff1"
+  colnames(CheckProp4)[7]<-"Diff2"
+  CheckProp4
+  }
+
+
+```
+
+####Gender of Oldest Operator
+
+```{r Checking Gender, include=TRUE}
+
+# ggplot(md,aes(x=gender))+
+#   geom_bar()
+  
+FP_gender<-CheckPropFun("gender",md)
+kable(FP_gender,align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))%>%
+  add_header_above(c("Variable" = 1,
+                     "Population Proportion" = 1,
+                     "Increase Category" = 3,
+                     "Significant Diffs"=2))%>%
+  add_header_above(c("\n\nProportion Table for gender"=7))
+
+FP_gender_long1<-gather(FP_gender,"Increase Category","Proportion",`Group Total`:`Large Increase`)
+FP_gender_long1<-transform(FP_gender_long1, 
+                        IncCat=factor(`Increase Category`,
+                                      levels=c("Group Total",
+                                               "Decreased or No Change",
+                                               "Small Increase",
+                                               "Large Increase")))
+
+gender.chart <- ggplot(FP_gender_long1,aes(x=gender,y=Proportion,fill=IncCat))+
+  geom_bar(aes(y=Proportion),stat="identity",position = "dodge")+
+  scale_fill_manual(values=c("grey","darkviolet","orange","Red"),name="Increase Category")+
+  geom_text(aes(label=paste0(Proportion*100, "%")),position = position_dodge(width=1), angle=45)+
+  scale_y_continuous(labels=scales::percent)+
+  xlab("Gender")+
+  ggtitle("\n\nIncrease Category Proportion by Gender",
+          subtitle="The Group Total is the sample proportion")+
+  theme_minimal(base_size=20,base_line_size=11/22)
+
+gender.chart
+```
+
+
+```{r, echo=FALSE}
+## Men 25 or younger with large increases:
+md %>% filter(gender=="M") %>% filter(age <= 25) %>% filter(IncCat == "Large Increase") %>% nrow()
+
+## Men with large increases:
+md %>% filter(gender == "M") %>% filter(IncCat == "Large Increase") %>% nrow()
+```
+
+```{r Gender 25 and Under Chart}
+
+FP_genderlt25_df<-md%>%
+  filter(age<=25)
+FP_genderlt25<-CheckPropFun("gender",FP_genderlt25_df)
+kable(FP_genderlt25,align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))%>%
+  add_header_above(c("Variable" = 1,
+                     "Population Proportion" = 1,
+                     "Increase Category" = 3,
+                     "Significant Diffs"=2))%>%
+  add_header_above(c("\n\nProportion Table for gender, age<=25"=7))
+
+FP_gender_longlt25<-gather(FP_genderlt25,"Increase Category","Proportion",`Group Total`:`Large Increase`)
+FP_gender_longlt25<-transform(FP_gender_longlt25, 
+                           IncCat=factor(`Increase Category`,
+                                         levels=c("Group Total",
+                                                  "Decreased or No Change",
+                                                  "Small Increase",
+                                                  "Large Increase")))
+
+gender.25under.chart <- ggplot(FP_gender_longlt25,aes(x=gender,y=Proportion,fill=IncCat))+
+  geom_bar(aes(y=Proportion),stat="identity",position = "dodge")+
+  scale_fill_manual(values=c("grey","darkviolet","orange","Red"),name="Increase Category")+
+  geom_text(aes(label=paste0(Proportion*100, "%")),position = position_dodge(width=1), angle=45)+
+  scale_y_continuous(labels=scales::percent)+
+  xlab("Gender")+
+  ggtitle("\n\nIncrease Category Proportion by Gender, Age 25 or Younger",
+          subtitle="The Group Total is the sample proportion\nCaution: For the Large Increase, n=11")+
+  theme_minimal(base_size=20,base_line_size=11/22)
+
+gender.25under.chart
+```
+
+```{r Gender Over 25 Chart}
+FP_gendergt25_df<-md%>%
+  filter(age>25)
+FP_gendergt25<-CheckPropFun("gender",FP_gendergt25_df)
+kable(FP_gendergt25,align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))%>%
+  add_header_above(c("Variable" = 1,
+                     "Population Proportion" = 1,
+                     "Increase Category" = 3,
+                     "Significant Diffs"=2))%>%
+  add_header_above(c("\n\nProportion Table for gender, age>25"=7))
+
+FP_gender_longgt25<-gather(FP_gendergt25,"Increase Category","Proportion",`Group Total`:`Large Increase`)
+FP_gender_longgt25<-transform(FP_gender_longgt25, 
+                              IncCat=factor(`Increase Category`,
+                                            levels=c("Group Total",
+                                                     "Decreased or No Change",
+                                                     "Small Increase",
+                                                     "Large Increase")))
+
+gender.greater25.chart <- ggplot(FP_gender_longgt25,aes(x=gender,y=Proportion,fill=IncCat))+
+  geom_bar(aes(y=Proportion),stat="identity",position = "dodge")+
+  xlab("Gender") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_fill_manual(values=c("grey","darkviolet","orange","Red"),name="Increase Category")+
+  ggtitle("\n\nIncrease Category Proportion by Gender, Older than 25",
+          subtitle="The Group Total is the sample proportion")+
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  geom_text(aes(label=paste0(Proportion*100, "%")),position = position_dodge(width=1), angle=45)
+
+gender.greater25.chart
+```
+
+#### Age of Oldest Operator
+
+```{r Checking Age, include=TRUE}
+FP_age<-CheckPropFun("age_bucket",md)
+age.distribution.chart <- ggplot(md,aes(x=age,color=IncCat))+geom_density()+  scale_color_manual(values=c("darkviolet","Red","orange"),name="Increase Category")+
+  ggtitle("\n\nAge Distribution by Increase Category",
+          subtitle="Grey is the sample density, we expect all categories to track with the sample")+
+  ylab("Density")+
+  xlab("Age") +
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  geom_density(aes(x=age), color="grey")
+
+md %>% filter(gender == "F") %>% filter(county == "BALTIMORE") %>% filter(age == 42) %>% select(current_premium, indicated_premium, selected_premium, IncDivCur, SelDivCur)
+
+age.distribution.chart
+```
+
+```{r}
+kable(FP_age,align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))%>%
+  add_header_above(c("Variable" = 1,
+                     "Population Proportion" = 1,
+                     "Increase Category" = 3,
+                     "Significant Diffs"=2))%>%
+  add_header_above(c("\n\nProportion Table for Stat.Area"=7))
+
+
+FP_age$mid<-c(28,51,70)
+category_by_median_income <- ggplot(FP_age,aes(x=mid))+xlab("midpoints of the buckets")+
+  geom_line(aes(y=`Group Total`),col="grey")+
+  geom_line(aes(y=`Decreased or No Change`),col="darkviolet")+
+  geom_line(aes(y=`Small Increase`),col="orange")+
+  geom_line(aes(y=`Large Increase`),col="red")+
+  ggtitle("\n\nIncrease Category Proportion by median income",
+          subtitle="Grey is the sample proportion, we expect all categories to track with the sample")+
+  ylab("Proportion")+
+  theme_minimal(base_size=20,base_line_size=11/22)
+```
+
+```{r}
+FP_age_long<-gather(FP_age,"Increase Category","Proportion",`Group Total`:`Large Increase`)
+FP_age_long<-transform(FP_age_long,
+                        IncCat=factor(`Increase Category`,
+                                      levels=c("Group Total",
+                                               "Decreased or No Change",
+                                               "Small Increase",
+                                               "Large Increase")))
+                                               
+age.category.chart <- ggplot(FP_age_long,aes(x=age_bucket,y=Proportion,fill=IncCat))+
+  geom_bar(aes(y=Proportion),stat="identity",position = "dodge")+
+  scale_fill_manual(values=c("grey","darkviolet","orange","Red"),name="Increase Category")+
+  geom_text(aes(label=paste0(Proportion*100, "%")),position = position_dodge(width=1), angle=45)+
+  ggtitle("\n\nIncrease Category Proportion by Age Group",
+          subtitle="The Group Total is the sample proportion")+
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  scale_y_continuous(labels=scales::percent)+
+  xlab("Age Group")
+
+age.category.chart
+```
+
+```{r}
+older <- md %>% filter(age_bucket == "63+")
+
+paste0('Of the ', nrow(older),' customers in that age group,')
+
+paste0( nrow((filter(older, indicated_premium < current_premium))) / nrow(older) * 100,'% were owed discounts.')
+
+paste0("These customers were owed a median discount of $", median((filter(older, indicated_premium < current_premium))$IndMinCur) * -1," to reach their ideal price,") 
+paste0("but would have received a median transition discount of a paltry $", median((filter(older, indicated_premium < current_premium))$SelMinCur) * -1,".")
+
+```
+
+
+#### Racial Composition of Zip Code
+
+```{r Checking percentage_nonwhite, include=TRUE}
+pnw.chart <- ggplot(md,aes(x=percentage_nonwhite,color=IncCat))+geom_density()+  scale_color_manual(values=c("darkviolet","Red","orange"),name="Increase Category")+
+  ggtitle("\n\nPercentage Nonwhite Distribution by Increase Category",
+          subtitle="Grey is the sample density, we expect all categories to track with the sample")+
+  ylab("Density")+
+  xlab("Percentage Non-White")+
+  scale_x_continuous(labels=scales::percent)+
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  geom_density(aes(x=percentage_nonwhite), color="grey")
+
+pnw.chart
+```
+
+```{r}
+
+FP_pnw<-CheckPropFun("PNW_bucket4",md)
+
+FP_pnw2<-as.data.frame(FP_pnw[order(FP_pnw$PNW_bucket4),])
+
+kable(FP_pnw2,align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))%>%
+  add_header_above(c("RN"=1,
+                     "Variable" = 1,
+                     "Population Proportion" = 1,
+                     "Increase Category" = 3,
+                     "Significant Diffs"=2))%>%
+  add_header_above(c("\n\nProportion Table for percentage_nonwhite"=8))
+
+
+FP_pnw2$mid<-c(.125,0.3725,0.635,0.875)
+inc_category_proportion_by_pct <- ggplot(FP_pnw2,aes(x=mid))+xlab("midpoints of the buckets")+
+  geom_line(aes(y=`Group Total`),col="grey")+
+  geom_line(aes(y=`Decreased or No Change`),col="darkviolet")+
+  geom_line(aes(y=`Small Increase`),col="orange")+
+  geom_line(aes(y=`Large Increase`),col="red")+
+  ggtitle("\n\nIncrease Category Proportion by Percentage Non-White",
+          subtitle="Grey is the sample proportion, we expect all categories to track with the sample")+
+  ylab("Proportion")+
+  theme_minimal(base_size=20,base_line_size=11/22)
+
+FP_pnw_long2<-gather(FP_pnw2,"Increase Category","Proportion",`Group Total`:`Large Increase`)
+FP_pnw_long2<-transform(FP_pnw_long2, 
+                        IncCat=factor(`Increase Category`,
+                                      levels=c("Group Total",
+                                               "Decreased or No Change",
+                                               "Small Increase",
+                                               "Large Increase")))
+```
+
+```{r}
+pnw.proportion.chart <- ggplot(FP_pnw_long2,aes(x=PNW_bucket4,y=Proportion,fill=IncCat))+
+  geom_bar(aes(y=Proportion),stat="identity",position = "dodge")+
+  scale_fill_manual(values=c("grey","darkviolet","orange","Red"),name="Increase Category")+
+  ggtitle("\n\nIncrease Category Proportion by Percentage Non-White",
+          subtitle="The Group Total is the sample proportion")+
+  geom_text(aes(label=paste0(Proportion*100, "%")),position = position_dodge(width=1), angle=70)+
+  scale_y_continuous(labels=scales::percent)+
+  theme_minimal(base_size=20,base_line_size=11/22)+
+  theme(axis.text.x = element_text(angle = 45))+
+  xlab("Percentage Non-White")
+
+pnw.proportion.chart
+```
+
+## Concluding Discussion
+
+```{r}
+overpay <- md %>% filter(indicated_premium < current_premium)
+
+## While those customers were own an average of...
+mean(overpay$IndMinCur)
+mean(overpay$SelMinCur)
+
+## While those customers were owed a median
+median(overpay$IndMinCur)
+median(overpay$SelMinCur)
+
+###
+overpay %>% group_by(age_bucket) %>% summarise(n = n())
+
+md %>% filter(age_bucket == "63+") %>% group_by(IncCat) %>% summarise(n = n(), mean_sel = mean(SelMinCur), mean_ind = mean(IndMinCur), median_sel = median(SelMinCur), median_ind = median(IndMinCur))
+```
+
+## Acknowledgments 
